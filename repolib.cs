@@ -9,16 +9,14 @@ namespace RepoMigrationTool.Models
         public string DestinationUrl { get; set; }
         public string LocalPath { get; set; }
         public string CommitMessage { get; set; }
-        public CredentialsConfig Source { get; set; }
-        public CredentialsConfig Destination { get; set; }
+        public CredentialsConfig Credentials { get; set; } = new CredentialsConfig();
         public MigrationOptions Options { get; set; } = new MigrationOptions();
     }
 
     public class CredentialsConfig
     {
-        public string Username { get; set; }
-        public string Password { get; set; }
-        public string PersonalAccessToken { get; set; }
+        public string AdoToken { get; set; }
+        public string GitHubToken { get; set; }
     }
 
     public class MigrationOptions
@@ -76,14 +74,14 @@ namespace RepoMigrationTool.Interfaces
 {
     public interface IGitOperations
     {
-        Task<IGitRepository> CloneRepositoryAsync(string sourceUrl, string localPath, CredentialsConfig credentials);
-        Task FetchAllBranchesAsync(IGitRepository repository, CredentialsConfig credentials);
+        Task<IGitRepository> CloneRepositoryAsync(string sourceUrl, string localPath, string adoToken);
+        Task FetchAllBranchesAsync(IGitRepository repository, string adoToken);
         Task RenameDefaultBranchAsync(IGitRepository repository, MigrationOptions options);
         Task SetRemoteUrlAsync(IGitRepository repository, string newUrl);
-        Task MergeRemoteMainAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options);
+        Task MergeRemoteMainAsync(IGitRepository repository, string githubToken, MigrationOptions options);
         Task CreateCommitIfNeededAsync(IGitRepository repository, string commitMessage);
-        Task PushAllBranchesAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options);
-        Task PushAllTagsAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options);
+        Task PushAllBranchesAsync(IGitRepository repository, string githubToken, MigrationOptions options);
+        Task PushAllTagsAsync(IGitRepository repository, string githubToken, MigrationOptions options);
     }
 }
 
@@ -150,6 +148,9 @@ namespace RepoMigrationTool.Services
 
                 var config = deserializer.Deserialize<MigrationConfig>(yamlContent);
                 
+                // Load credentials from environment variables
+                LoadCredentialsFromEnvironment(config);
+                
                 ValidateConfig(config);
                 _logger.LogInformation("Configuration loaded successfully");
                 
@@ -159,6 +160,27 @@ namespace RepoMigrationTool.Services
             {
                 _logger.LogError("Failed to load configuration", ex);
                 throw;
+            }
+        }
+
+        private void LoadCredentialsFromEnvironment(MigrationConfig config)
+        {
+            _logger.LogInformation("Loading credentials from environment variables");
+            
+            // Load ADO token from environment variable
+            var adoToken = Environment.GetEnvironmentVariable("ADO_PAT");
+            if (!string.IsNullOrEmpty(adoToken))
+            {
+                config.Credentials.AdoToken = adoToken;
+                _logger.LogInformation("ADO token loaded from environment variable");
+            }
+            
+            // Load GitHub token from environment variable
+            var githubToken = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+            if (!string.IsNullOrEmpty(githubToken))
+            {
+                config.Credentials.GitHubToken = githubToken;
+                _logger.LogInformation("GitHub token loaded from environment variable");
             }
         }
 
@@ -175,6 +197,12 @@ namespace RepoMigrationTool.Services
             
             if (string.IsNullOrEmpty(config.CommitMessage))
                 throw new ArgumentException("CommitMessage is required");
+                
+            if (string.IsNullOrEmpty(config.Credentials.AdoToken))
+                throw new ArgumentException("ADO_PAT environment variable is required");
+                
+            if (string.IsNullOrEmpty(config.Credentials.GitHubToken))
+                throw new ArgumentException("GITHUB_TOKEN environment variable is required");
         }
     }
 }
@@ -293,7 +321,7 @@ namespace RepoMigrationTool.Services
             _logger = logger;
         }
 
-        public async Task<IGitRepository> CloneRepositoryAsync(string sourceUrl, string localPath, CredentialsConfig credentials)
+        public async Task<IGitRepository> CloneRepositoryAsync(string sourceUrl, string localPath, string adoToken)
         {
             return await Task.Run(() =>
             {
@@ -311,9 +339,9 @@ namespace RepoMigrationTool.Services
                     RecurseSubmodules = true
                 };
 
-                if (credentials != null)
+                if (!string.IsNullOrEmpty(adoToken))
                 {
-                    cloneOptions.CredentialsProvider = CreateCredentialsProvider(credentials);
+                    cloneOptions.CredentialsProvider = CreateAdoCredentialsProvider(adoToken);
                 }
 
                 var repository = Repository.Clone(sourceUrl, localPath, cloneOptions);
@@ -323,16 +351,16 @@ namespace RepoMigrationTool.Services
             });
         }
 
-        public async Task FetchAllBranchesAsync(IGitRepository repository, CredentialsConfig credentials)
+        public async Task FetchAllBranchesAsync(IGitRepository repository, string adoToken)
         {
             await Task.Run(() =>
             {
                 _logger.LogInformation("Fetching all branches");
 
                 var fetchOptions = new FetchOptions();
-                if (credentials != null)
+                if (!string.IsNullOrEmpty(adoToken))
                 {
-                    fetchOptions.CredentialsProvider = CreateCredentialsProvider(credentials);
+                    fetchOptions.CredentialsProvider = CreateAdoCredentialsProvider(adoToken);
                 }
 
                 repository.Fetch("origin", fetchOptions, "Fetching all branches");
@@ -386,7 +414,7 @@ namespace RepoMigrationTool.Services
             });
         }
 
-        public async Task MergeRemoteMainAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options)
+        public async Task MergeRemoteMainAsync(IGitRepository repository, string githubToken, MigrationOptions options)
         {
             await Task.Run(() =>
             {
@@ -395,9 +423,9 @@ namespace RepoMigrationTool.Services
                 try
                 {
                     var fetchOptions = new FetchOptions();
-                    if (credentials != null)
+                    if (!string.IsNullOrEmpty(githubToken))
                     {
-                        fetchOptions.CredentialsProvider = CreateCredentialsProvider(credentials);
+                        fetchOptions.CredentialsProvider = CreateGitHubCredentialsProvider(githubToken);
                     }
 
                     repository.Fetch("origin", fetchOptions, "Fetching from new remote");
@@ -465,16 +493,16 @@ namespace RepoMigrationTool.Services
             });
         }
 
-        public async Task PushAllBranchesAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options)
+        public async Task PushAllBranchesAsync(IGitRepository repository, string githubToken, MigrationOptions options)
         {
             await Task.Run(() =>
             {
                 _logger.LogInformation("Pushing all branches");
 
                 var pushOptions = new PushOptions();
-                if (credentials != null)
+                if (!string.IsNullOrEmpty(githubToken))
                 {
-                    pushOptions.CredentialsProvider = CreateCredentialsProvider(credentials);
+                    pushOptions.CredentialsProvider = CreateGitHubCredentialsProvider(githubToken);
                 }
 
                 var localBranches = repository.Branches
@@ -492,16 +520,16 @@ namespace RepoMigrationTool.Services
             });
         }
 
-        public async Task PushAllTagsAsync(IGitRepository repository, CredentialsConfig credentials, MigrationOptions options)
+        public async Task PushAllTagsAsync(IGitRepository repository, string githubToken, MigrationOptions options)
         {
             await Task.Run(() =>
             {
                 _logger.LogInformation("Pushing all tags");
 
                 var pushOptions = new PushOptions();
-                if (credentials != null)
+                if (!string.IsNullOrEmpty(githubToken))
                 {
-                    pushOptions.CredentialsProvider = CreateCredentialsProvider(credentials);
+                    pushOptions.CredentialsProvider = CreateGitHubCredentialsProvider(githubToken);
                 }
 
                 var tags = repository.Tags
@@ -523,29 +551,27 @@ namespace RepoMigrationTool.Services
             });
         }
 
-        private CredentialsHandler CreateCredentialsProvider(CredentialsConfig credentials)
+        private CredentialsHandler CreateAdoCredentialsProvider(string adoToken)
         {
             return (_url, _user, _cred) =>
             {
-                if (!string.IsNullOrEmpty(credentials.PersonalAccessToken))
-                {
-                    return new UsernamePasswordCredentials 
-                    { 
-                        Username = credentials.Username ?? "token", 
-                        Password = credentials.PersonalAccessToken 
-                    };
-                }
-                
-                if (!string.IsNullOrEmpty(credentials.Username) && !string.IsNullOrEmpty(credentials.Password))
-                {
-                    return new UsernamePasswordCredentials 
-                    { 
-                        Username = credentials.Username, 
-                        Password = credentials.Password 
-                    };
-                }
+                return new UsernamePasswordCredentials 
+                { 
+                    Username = "token", 
+                    Password = adoToken 
+                };
+            };
+        }
 
-                return null;
+        private CredentialsHandler CreateGitHubCredentialsProvider(string githubToken)
+        {
+            return (_url, _user, _cred) =>
+            {
+                return new UsernamePasswordCredentials 
+                { 
+                    Username = "token", 
+                    Password = githubToken 
+                };
             };
         }
     }
@@ -583,10 +609,10 @@ namespace RepoMigrationTool.Services
                 repository = await _gitOperations.CloneRepositoryAsync(
                     config.SourceUrl, 
                     config.LocalPath, 
-                    config.Source);
+                    config.Credentials.AdoToken);
 
                 // Steps 2-3: Fetch all branches
-                await _gitOperations.FetchAllBranchesAsync(repository, config.Source);
+                await _gitOperations.FetchAllBranchesAsync(repository, config.Credentials.AdoToken);
 
                 // Step 4: Rename default branch
                 await _gitOperations.RenameDefaultBranchAsync(repository, config.Options);
@@ -595,16 +621,16 @@ namespace RepoMigrationTool.Services
                 await _gitOperations.SetRemoteUrlAsync(repository, config.DestinationUrl);
 
                 // Step 6: Merge remote main
-                await _gitOperations.MergeRemoteMainAsync(repository, config.Destination, config.Options);
+                await _gitOperations.MergeRemoteMainAsync(repository, config.Credentials.GitHubToken, config.Options);
 
                 // Step 7: Create commit with message
                 await _gitOperations.CreateCommitIfNeededAsync(repository, config.CommitMessage);
 
                 // Step 8: Push all branches
-                await _gitOperations.PushAllBranchesAsync(repository, config.Destination, config.Options);
+                await _gitOperations.PushAllBranchesAsync(repository, config.Credentials.GitHubToken, config.Options);
 
                 // Step 9: Push all tags
-                await _gitOperations.PushAllTagsAsync(repository, config.Destination, config.Options);
+                await _gitOperations.PushAllTagsAsync(repository, config.Credentials.GitHubToken, config.Options);
 
                 _logger.LogInformation("Repository migration completed successfully!");
             }
